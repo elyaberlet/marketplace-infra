@@ -1,0 +1,139 @@
+services:
+  auth-postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: authdb
+      POSTGRES_USER: authuser
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD:?AUTH_DB_PASSWORD is required}
+    volumes:
+      - auth_postgres_data:/var/lib/postgresql/data
+    networks:
+      - marketplace-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authuser -d authdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  user-postgres:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: userdb
+      POSTGRES_USER: ${USER_DB_USERNAME:?USER_DB_USERNAME is required}
+      POSTGRES_PASSWORD: ${USER_DB_PASSWORD:?USER_DB_PASSWORD is required}
+    volumes:
+      - user_postgres_data:/var/lib/postgresql/data
+    networks:
+      - marketplace-network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks:
+      - marketplace-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  auth-service:
+    image: ghcr.io/elyaberlet/auth-module:latest
+    restart: unless-stopped
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_URL: jdbc:postgresql://auth-postgres:5432/authdb
+      DB_USERNAME: authuser
+      DB_PASSWORD: ${AUTH_DB_PASSWORD}
+      JWT_PRIVATE_KEY_PATH: /run/secrets/jwt_private_key
+      JWT_PUBLIC_KEY_PATH: /run/secrets/jwt_public_key
+      USER_SERVICE_URL: http://user-service:8081
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      ADMIN_USER_ID: ${ADMIN_USER_ID:-}
+    networks:
+      - marketplace-network
+    depends_on:
+      auth-postgres:
+        condition: service_healthy
+      user-service:
+        condition: service_started
+    secrets:
+      - jwt_private_key
+      - jwt_public_key
+
+  user-service:
+    image: ghcr.io/elyaberlet/user-module:latest
+    restart: unless-stopped
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_URL: jdbc:postgresql://user-postgres:5432/userdb
+      DB_USERNAME: ${USER_DB_USERNAME}
+      DB_PASSWORD: ${USER_DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      AUTH_JWKS_URI: http://auth-service:8082/.well-known/jwks.json
+    networks:
+      - marketplace-network
+    depends_on:
+      user-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  api-gateway:
+    image: ghcr.io/elyaberlet/api-gateway:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SERVER_PORT: 8080
+      AUTH_SERVICE_URI: http://auth-service:8082
+      USER_SERVICE_URI: http://user-service:8081
+      AUTH_JWKS_URI: http://auth-service:8082/.well-known/jwks.json
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RATE_LIMIT_REPLENISH_RATE: ${RATE_LIMIT_REPLENISH_RATE:-10}
+      RATE_LIMIT_BURST_CAPACITY: ${RATE_LIMIT_BURST_CAPACITY:-20}
+    networks:
+      - marketplace-network
+    depends_on:
+      auth-service:
+        condition: service_started
+      user-service:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  auth_postgres_data:
+  user_postgres_data:
+
+networks:
+  marketplace-network:
+    driver: bridge
+    internal: true
+
+secrets:
+  jwt_private_key:
+    file: ../auth-module/secrets/private_key.pem
+  jwt_public_key:
+    file: ../auth-module/secrets/public_key.pem
