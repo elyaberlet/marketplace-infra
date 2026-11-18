@@ -36,6 +36,28 @@ services:
       retries: 10
       start_period: 10s
 
+  order-postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: orderdb
+      POSTGRES_USER: ${ORDER_DB_USERNAME:?ORDER_DB_USERNAME is required}
+      POSTGRES_PASSWORD: ${ORDER_DB_PASSWORD:?ORDER_DB_PASSWORD is required}
+    ports:
+      - "5434:5432"
+    volumes:
+      - order_postgres_data:/var/lib/postgresql/data
+    networks:
+      - marketplace-network
+      - public-network
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -49,6 +71,9 @@ services:
       retries: 10
 
   auth-service:
+    build:
+      context: ../auth-module
+      dockerfile: Dockerfile
     image: ghcr.io/elyaberlet/auth-module:latest
     restart: unless-stopped
     environment:
@@ -61,7 +86,12 @@ services:
       USER_SERVICE_URL: http://user-service:8081
       ADMIN_USERNAME: ${ADMIN_USERNAME:-}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
-      ADMIN_USER_ID: ${ADMIN_USER_ID:-}
+      ADMIN_NAME: ${ADMIN_NAME:-}
+      ADMIN_SURNAME: ${ADMIN_SURNAME:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      SERVICE_ACCOUNT_USERNAME: ${SERVICE_ACCOUNT_USERNAME:?SERVICE_ACCOUNT_USERNAME is required}
+      SERVICE_ACCOUNT_PASSWORD: ${SERVICE_ACCOUNT_PASSWORD:?SERVICE_ACCOUNT_PASSWORD is required}
+      SERVICE_ACCOUNT_USER_ID: ${SERVICE_ACCOUNT_USER_ID:-900000001}
     networks:
       - marketplace-network
     depends_on:
@@ -74,6 +104,9 @@ services:
       - jwt_public_key
 
   user-service:
+    build:
+      context: ../user-module
+      dockerfile: Dockerfile
     image: ghcr.io/elyaberlet/user-module:latest
     restart: unless-stopped
     environment:
@@ -92,7 +125,35 @@ services:
       redis:
         condition: service_healthy
 
+  order-service:
+    build:
+      context: ../order-module
+      dockerfile: Dockerfile
+    image: order-service:latest
+    restart: unless-stopped
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_URL: jdbc:postgresql://order-postgres:5432/orderdb
+      DB_USERNAME: ${ORDER_DB_USERNAME}
+      DB_PASSWORD: ${ORDER_DB_PASSWORD}
+      USER_SERVICE_URL: http://user-service:8081
+      AUTH_SERVICE_URL: http://auth-service:8082
+      SERVICE_ACCOUNT_USERNAME: ${SERVICE_ACCOUNT_USERNAME:?SERVICE_ACCOUNT_USERNAME is required}
+      SERVICE_ACCOUNT_PASSWORD: ${SERVICE_ACCOUNT_PASSWORD:?SERVICE_ACCOUNT_PASSWORD is required}
+    networks:
+      - marketplace-network
+    depends_on:
+      order-postgres:
+        condition: service_healthy
+      user-service:
+        condition: service_started
+      auth-service:
+        condition: service_started
+
   api-gateway:
+    build:
+      context: ../api-gateway-module
+      dockerfile: Dockerfile
     image: ghcr.io/elyaberlet/api-gateway:latest
     restart: unless-stopped
     ports:
@@ -102,6 +163,7 @@ services:
       SERVER_PORT: 8080
       AUTH_SERVICE_URI: http://auth-service:8082
       USER_SERVICE_URI: http://user-service:8081
+      ORDER_SERVICE_URI: http://order-service:8080
       AUTH_JWKS_URI: http://auth-service:8082/.well-known/jwks.json
       REDIS_HOST: redis
       REDIS_PORT: 6379
@@ -109,10 +171,13 @@ services:
       RATE_LIMIT_BURST_CAPACITY: ${RATE_LIMIT_BURST_CAPACITY:-20}
     networks:
       - marketplace-network
+      - public-network
     depends_on:
       auth-service:
         condition: service_started
       user-service:
+        condition: service_started
+      order-service:
         condition: service_started
       redis:
         condition: service_healthy
@@ -126,11 +191,16 @@ services:
 volumes:
   auth_postgres_data:
   user_postgres_data:
+  order_postgres_data:
 
 networks:
+  # Внутренняя сеть: сервисы и БД без выхода наружу
   marketplace-network:
     driver: bridge
     internal: true
+  # Обычная сеть: нужна, чтобы работала публикация портов на хост
+  public-network:
+    driver: bridge
 
 secrets:
   jwt_private_key:
